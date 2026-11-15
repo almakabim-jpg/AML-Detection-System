@@ -474,13 +474,29 @@ with tab_transactions:
             st.markdown("**Uploaded transaction preview (first 100 rows)**")
             st.dataframe(current.head(100), use_container_width=True, hide_index=True)
     else:
-        show_flagged = st.checkbox("Show flagged transactions only", value=True)
+        t1, t2 = st.columns([1, 1])
+        with t1:
+            show_flagged = st.checkbox("Show flagged transactions only", value=True)
+        with t2:
+            sort_mode = st.selectbox(
+                "Sort order",
+                ["Highest risk score first", "Lowest risk score first", "Chronological (Timestamp)"],
+                index=0 if show_flagged else 2,
+            )
+
         view = scored[scored["Flag for review"]] if show_flagged else scored
-        top_view = view.nlargest(1000, "Risk score (uncalibrated)").copy()
+
+        if sort_mode == "Highest risk score first":
+            top_view = view.nlargest(1000, "Risk score (uncalibrated)").copy()
+        elif sort_mode == "Lowest risk score first":
+            top_view = view.nsmallest(1000, "Risk score (uncalibrated)").copy()
+        else:
+            top_view = view.sort_values("Timestamp").head(1000).copy()
+
         top_view["Flag for review"] = top_view["Flag for review"].map(
             {True: "🟢 YES (Flagged)", False: "⚪ No"}
         )
-        st.caption(f"Showing top {len(top_view):,} of {len(view):,} matching transactions (download full results in Reports).")
+        st.caption(f"Showing {len(top_view):,} of {len(view):,} matching transactions (download full results in Reports).")
         st.dataframe(top_view, use_container_width=True, hide_index=True)
 
 # 4. Accounts Tab
