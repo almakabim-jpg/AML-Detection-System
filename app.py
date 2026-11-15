@@ -1,23 +1,20 @@
-"""Light Streamlit interface for the AML Statement Analyzer.
 
-The interface can be explored before model training. Before a trained model is
-available, uploaded data can be profiled (counts, volumes and relationships),
-but no transaction is labelled suspicious and no risk score is fabricated.
-"""
-from pathlib import Path
 import json
+from pathlib import Path
 
+import joblib
+import numpy as np
 import pandas as pd
 import streamlit as st
 
-try:
-    import joblib
-except ImportError:  # Allows the interface to render even before dependencies install.
-    joblib = None
+from common import prepare, FEATURES
 
-from common import FEATURES, prepare
 
-BASE_DIR = Path(__file__).parent
+# ============================================================
+# APPLICATION CONFIGURATION
+# ============================================================
+
+BASE_DIR = Path(__file__).resolve().parent
 MODEL_PATH = BASE_DIR / "aml_model.joblib"
 METRICS_PATH = BASE_DIR / "evaluation_metrics.json"
 
@@ -28,293 +25,963 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-# ------------------------------ Theme --------------------------------------
-st.markdown("""
-<style>
-:root { color-scheme: light; }
-.stApp { background: #f4f7fb; color: #17243a; }
-[data-testid="stHeader"] { background: rgba(244,247,251,.96); }
-[data-testid="stSidebar"] { background: #ffffff; border-right: 1px solid #e1e7f0; }
-.block-container { padding-top: 1.6rem; padding-bottom: 2.5rem; max-width: 1500px; }
-[data-testid="stMetric"] { background: #ffffff; border: 1px solid #e1e7f0; padding: 17px 18px; border-radius: 13px; box-shadow: 0 2px 8px rgba(20,40,70,.04); }
-[data-testid="stMetricLabel"] { color: #61718a; }
-[data-testid="stMetricValue"] { color: #17243a; }
-section[data-testid="stFileUploaderDropzone"] { background: #fbfcfe; border: 1px dashed #9aabc2; border-radius: 12px; }
-.stButton > button, .stDownloadButton > button { border-radius: 9px; font-weight: 650; min-height: 2.7rem; }
-div[data-testid="stTabs"] button { color: #42536c; }
-.panel { background: #ffffff; border: 1px solid #e1e7f0; padding: 17px 19px; border-radius: 13px; }
-.small-muted { color: #61718a; font-size: .88rem; }
-.status-pill { display:inline-block; padding:5px 10px; border-radius:20px; background:#e8f0fb; color:#294d7c; font-size:.78rem; border:1px solid #d4e1f2; }
-hr { border-color: #e1e7f0; }
-/* Keep forms and tables crisp against the light canvas. */
-[data-testid="stDataFrame"] { background: #ffffff; border-radius: 10px; }
-[data-testid="stAlert"] { border-radius: 10px; }
-</style>
-""", unsafe_allow_html=True)
 
-# ------------------------------ Helpers ------------------------------------
-def read_csv_safely(file) -> pd.DataFrame:
-    file.seek(0)
-    df = pd.read_csv(
-        file,
-        dtype={"From Bank": str, "To Bank": str, "Account": str, "Account.1": str},
-        low_memory=False,
-    )
-    if "Account.1" not in df.columns and "To Account" in df.columns:
-        df = df.rename(columns={"To Account": "Account.1"})
-    return df
+# ============================================================
+# LIGHT DASHBOARD STYLING
+# ============================================================
 
+st.markdown(
+    """
+    <style>
+    .stApp {
+        background-color: #F7F9FC;
+        color: #172033;
+    }
 
-def money_label(value) -> str:
-    try:
-        return f"{float(value):,.2f}"
-    except (TypeError, ValueError):
-        return "—"
+    h1, h2, h3 {
+        color: #172033;
+    }
+
+    [data-testid="stMetric"] {
+        background-color: white;
+        border: 1px solid #E2E8F0;
+        padding: 16px;
+        border-radius: 10px;
+    }
+
+    div[data-testid="stDataFrame"] {
+        border: 1px solid #E2E8F0;
+        border-radius: 8px;
+    }
+
+    section[data-testid="stSidebar"] {
+        background-color: #FFFFFF;
+    }
+
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 
 
-def account_summary(df: pd.DataFrame) -> pd.DataFrame:
-    sender = df.groupby(["From Bank", "Account"], dropna=False).agg(
-        transactions_sent=("Amount Paid", "size"),
-        total_sent=("Amount Paid", "sum"),
-        unique_recipients=("Account.1", "nunique"),
-    ).reset_index().rename(columns={"From Bank": "Bank", "Account": "Account ID"})
-    receiver = df.groupby(["To Bank", "Account.1"], dropna=False).agg(
-        transactions_received=("Amount Received", "size"),
-        total_received=("Amount Received", "sum"),
-        unique_senders=("Account", "nunique"),
-    ).reset_index().rename(columns={"To Bank": "Bank", "Account.1": "Account ID"})
-    result = sender.merge(receiver, on=["Bank", "Account ID"], how="outer").fillna(0)
-    for c in ["transactions_sent", "transactions_received", "unique_recipients", "unique_senders"]:
-        result[c] = result[c].astype(int)
-    result["total_flow"] = result["total_sent"] + result["total_received"]
-    return result.sort_values("total_flow", ascending=False)
+# ============================================================
+# MODEL AND METRICS LOADING
+# ============================================================
 
-
-def network_summary(df: pd.DataFrame) -> pd.DataFrame:
-    result = df.groupby(
-        ["From Bank", "Account", "To Bank", "Account.1"], dropna=False
-    ).agg(
-        transaction_count=("Amount Paid", "size"),
-        total_amount=("Amount Paid", "sum"),
-        first_seen=("Timestamp", "min"),
-        last_seen=("Timestamp", "max"),
-    ).reset_index()
-    return result.sort_values(["transaction_count", "total_amount"], ascending=False)
-
-
+@st.cache_resource
 def load_model():
-    if not MODEL_PATH.exists() or joblib is None:
-        return None, None
+    """Load the saved AML model without stopping the application."""
+
+    if not MODEL_PATH.exists():
+        return None
+
     try:
         artifact = joblib.load(MODEL_PATH)
-        return artifact, None
-    except Exception as exc:
-        return None, str(exc)
+
+        # Verify that the model artifact has the expected structure.
+        if not isinstance(artifact, dict):
+            return None
+
+        if "model" not in artifact:
+            return None
+
+        if "features" not in artifact:
+            return None
+
+        # Ensure the saved feature order matches common.py.
+        if list(artifact["features"]) != list(FEATURES):
+            return None
+
+        return artifact
+
+    except Exception as error:
+        st.warning(f"Could not load the trained model: {error}")
+        return None
 
 
-# ------------------------------ Sidebar ------------------------------------
-artifact, model_error = load_model()
-model_ready = artifact is not None
-with st.sidebar:
-    st.markdown("## 🔎 AML ANALYZER")
-    st.caption("Financial transaction risk review")
-    st.markdown("---")
-    st.markdown("**SYSTEM STATUS**")
-    if model_ready:
-        st.success("Trained model connected")
-    elif model_error:
-        st.error("Model file could not be loaded")
-    else:
-        st.warning("Demo / pre-training mode")
-    st.markdown("---")
-    st.markdown("**INPUT REQUIREMENTS**")
-    st.write("• CSV transaction history")
-    st.write("• IBM HI-Small-style columns")
-    st.caption("PDF and image statements are not supported in this prototype.")
-    st.markdown("---")
-    st.markdown("**IMPORTANT**")
-    st.caption("Flags are review indicators, not proof of money laundering. A human must investigate.")
+@st.cache_data
+def load_metrics():
+    """Load evaluation metrics when the training script has generated them."""
 
-# ------------------------------ Header -------------------------------------
-left, right = st.columns([4, 1])
-with left:
-    st.markdown("# AML Statement Analyzer")
-    st.markdown("Identify transaction patterns and prioritize activity for human review.")
-with right:
-    st.markdown('<div style="text-align:right;padding-top:15px"><span class="status-pill">ACADEMIC PROTOTYPE</span></div>', unsafe_allow_html=True)
+    if not METRICS_PATH.exists():
+        return None
 
-# ------------------------------ Overview cards -----------------------------
-if "analysis_df" not in st.session_state:
-    st.session_state.analysis_df = None
-if "scored_df" not in st.session_state:
-    st.session_state.scored_df = None
+    try:
+        with open(METRICS_PATH, "r", encoding="utf-8") as file:
+            return json.load(file)
+    except Exception:
+        return None
 
-current = st.session_state.analysis_df
-if current is not None and not current.empty:
-    total_tx = len(current)
-    total_accounts = pd.concat([current["Account"].astype(str), current["Account.1"].astype(str)]).nunique()
-    total_volume = pd.to_numeric(current["Amount Paid"], errors="coerce").fillna(0).sum()
-else:
-    total_tx, total_accounts, total_volume = 0, 0, 0
-flagged_count = int(st.session_state.scored_df["Flag for review"].sum()) if st.session_state.scored_df is not None else None
-m1, m2, m3, m4 = st.columns(4)
-m1.metric("Transactions loaded", f"{total_tx:,}" if current is not None else "—")
-m2.metric("Accounts observed", f"{total_accounts:,}" if current is not None else "—")
-m3.metric("Total transaction volume", money_label(total_volume) if current is not None else "—")
-m4.metric("Flagged for review", f"{flagged_count:,}" if flagged_count is not None else "Unavailable")
 
-st.markdown("---")
+artifact = load_model()
+metrics = load_metrics()
 
-# ------------------------------ Main tabs ----------------------------------
-tab_dashboard, tab_analyze, tab_transactions, tab_accounts, tab_network, tab_reports, tab_model = st.tabs([
-    "◈ Dashboard", "＋ New Analysis", "▤ Transactions", "◎ Accounts", "⌘ Network", "⇩ Reports", "⚙ Model & Metrics"
-])
 
-with tab_dashboard:
-    st.subheader("Dashboard overview")
-    if current is None:
-        st.info("Upload a transaction-history CSV in **New Analysis** to populate the dashboard.")
-        st.markdown("<div class='panel'><b>Getting started</b><p class='small-muted'>1. Upload a CSV file · 2. Choose an analysis type · 3. Run the analysis · 4. Review the results and export them.</p></div>", unsafe_allow_html=True)
-    else:
-        d1, d2 = st.columns(2)
-        with d1:
-            st.markdown("**Transaction volume by payment currency**")
-            currency_volume = current.groupby("Payment Currency")["Amount Paid"].sum().sort_values(ascending=False).head(10)
-            st.bar_chart(currency_volume)
-        with d2:
-            st.markdown("**Transactions over time**")
-            dates = pd.to_datetime(current["Timestamp"], errors="coerce")
-            daily = dates.dt.date.value_counts().sort_index()
-            daily.index = daily.index.astype(str)
-            st.line_chart(daily)
-        if flagged_count is None:
-            st.info("No model predictions are available yet. Charts above describe the uploaded data only; they do not identify laundering.")
-        else:
-            st.success(f"The connected model flagged {flagged_count:,} transaction(s) for human review at the selected threshold.")
+# ============================================================
+# DATA PROCESSING FUNCTIONS
+# ============================================================
 
-with tab_analyze:
-    st.subheader("Start a new analysis")
-    st.write("Upload structured transaction history and choose the scope of analysis.")
-    uploaded = st.file_uploader("Upload transaction history", type=["csv"], key="aml_csv", help="CSV only. PDF and image statements are not supported.")
-    c1, c2 = st.columns([2, 1])
-    with c1:
-        analysis_type = st.selectbox(
-            "Analysis type",
-            ["Comprehensive analysis (all three)", "Transaction-level analysis", "Account-level analysis", "Network-level analysis"],
-            help="Transaction scoring requires the trained model. Account and network summaries describe relationships in the uploaded file.",
+def read_uploaded_csv(uploaded_file):
+    """Read the uploaded transaction history while preserving account IDs."""
+
+    return pd.read_csv(
+        uploaded_file,
+        dtype={
+            "From Bank": str,
+            "To Bank": str,
+            "Account": str,
+            "Account.1": str,
+            "To Account": str,
+        },
+        low_memory=False,
+    )
+
+
+def analyze_transactions(raw_df, model_artifact, threshold):
+    """Prepare transaction features and calculate risk scores if possible."""
+
+    # Use the shared feature-engineering function used during model training.
+    clean_df = prepare(raw_df)
+
+    if clean_df.empty:
+        raise ValueError("No valid transactions remain after data preparation.")
+
+    # Do not attempt classification when no model is available.
+    if model_artifact is None:
+        clean_df["Risk Score"] = np.nan
+        clean_df["Risk Level"] = "Model unavailable"
+        clean_df["Flag for Review"] = False
+        return clean_df
+
+    # Verify that every feature required by the model exists.
+    missing = [
+        feature for feature in model_artifact["features"]
+        if feature not in clean_df.columns
+    ]
+
+    if missing:
+        raise ValueError(
+            "Missing model features: " + ", ".join(missing)
         )
-    with c2:
-        threshold = st.slider("Review threshold", 0.05, 0.95, 0.50, 0.05, help="Transactions at or above this model score are flagged. Only used when a trained model is available.")
-    if not model_ready:
-        st.warning("Pre-training mode: you can inspect the uploaded data and account/network activity. Risk scoring and AML flags will remain unavailable until a trained model is installed.")
-    if st.button("Analyze Transactions", type="primary", use_container_width=True, disabled=(uploaded is None)):
-        try:
-            with st.spinner("Loading and profiling transaction history..."):
-                raw = read_csv_safely(uploaded)
-                required = ["Timestamp", "From Bank", "Account", "To Bank", "Account.1", "Amount Received", "Receiving Currency", "Amount Paid", "Payment Currency", "Payment Format"]
-                missing = [c for c in required if c not in raw.columns]
-                if missing:
-                    raise ValueError("Missing required CSV columns: " + ", ".join(missing))
-                raw["Timestamp"] = pd.to_datetime(raw["Timestamp"], errors="coerce")
-                raw = raw.dropna(subset=["Timestamp"]).copy()
-                for col in ["Amount Paid", "Amount Received"]:
-                    raw[col] = pd.to_numeric(raw[col], errors="coerce").fillna(0).clip(lower=0)
-                if raw.empty:
-                    raise ValueError("No rows with valid timestamps were found.")
-                st.session_state.analysis_df = raw.reset_index(drop=True)
-                st.session_state.scored_df = None
-                st.session_state.analysis_type = analysis_type
-                st.session_state.threshold = threshold
-                if model_ready:
-                    prepared = prepare(raw)
-                    if list(artifact.get("features", FEATURES)) != list(FEATURES):
-                        raise ValueError("The model feature definitions do not match common.py. Please retrain the model.")
-                    scores = artifact["model"].predict_proba(prepared[FEATURES])[:, 1]
-                    prepared["Risk score (uncalibrated)"] = scores
-                    prepared["Flag for review"] = scores >= threshold
-                    st.session_state.scored_df = prepared
-            st.success(f"Successfully loaded and profiled {len(raw):,} transaction(s).")
-            if not model_ready:
-                st.info("Data profiling is complete. No risk scores or suspicious-transaction labels were generated because the model has not been trained.")
-            else:
-                st.success("Model scoring is complete. Review flagged records in the Transactions tab.")
-        except Exception as exc:
-            st.error(f"Analysis could not be completed: {exc}")
-    if current is not None:
-        st.caption(f"Last loaded analysis: {len(current):,} transaction rows. Open the other tabs to explore the uploaded data.")
 
-with tab_transactions:
-    st.subheader("Transaction investigation")
-    scored = st.session_state.scored_df
-    if scored is None:
-        st.info("Transaction-level risk scores will appear here after a trained model is connected and the uploaded file is analyzed.")
-        if current is not None:
-            st.markdown("**Uploaded transaction preview**")
-            st.dataframe(current.head(100), use_container_width=True, hide_index=True)
+    # Generate a score for each transaction using the trained classifier.
+    probabilities = model_artifact["model"].predict_proba(
+        clean_df[model_artifact["features"]]
+    )[:, 1]
+
+    clean_df["Risk Score"] = probabilities
+    clean_df["Risk Score (%)"] = (
+        probabilities * 100
+    ).round(2)
+
+    # Flag transactions based on the selected investigation threshold.
+    clean_df["Flag for Review"] = (
+        clean_df["Risk Score"] >= threshold
+    )
+
+    clean_df["Risk Level"] = np.where(
+        clean_df["Flag for Review"],
+        "Flagged",
+        "Not Flagged",
+    )
+
+    return clean_df
+
+
+def create_account_summary(df):
+    """Summarize the transaction activity of sender and receiver accounts."""
+
+    # Build a sender activity table.
+    sent = df[
+        ["Account", "Amount Paid"]
+    ].copy()
+
+    sent.columns = ["Account", "Amount"]
+    sent["Direction"] = "Sent"
+
+    # Build a receiver activity table.
+    received = df[
+        ["Account.1", "Amount Received"]
+    ].copy()
+
+    received.columns = ["Account", "Amount"]
+    received["Direction"] = "Received"
+
+    # Combine both directions into one account activity table.
+    activity = pd.concat(
+        [sent, received],
+        ignore_index=True
+    )
+
+    summary = activity.groupby("Account").agg(
+        Transaction_Count=("Amount", "count"),
+        Total_Amount=("Amount", "sum"),
+        Average_Amount=("Amount", "mean"),
+    ).reset_index()
+
+    # Add risk information when model predictions are available.
+    if "Risk Score" in df.columns and df["Risk Score"].notna().any():
+
+        sent_risk = df[
+            ["Account", "Risk Score", "Flag for Review"]
+        ].copy()
+
+        sent_risk.columns = [
+            "Account",
+            "Risk Score",
+            "Flag for Review",
+        ]
+
+        received_risk = df[
+            ["Account.1", "Risk Score", "Flag for Review"]
+        ].copy()
+
+        received_risk.columns = [
+            "Account",
+            "Risk Score",
+            "Flag for Review",
+        ]
+
+        risk_activity = pd.concat(
+            [sent_risk, received_risk],
+            ignore_index=True
+        )
+
+        risk_summary = risk_activity.groupby("Account").agg(
+            Maximum_Risk_Score=("Risk Score", "max"),
+            Average_Risk_Score=("Risk Score", "mean"),
+            Flagged_Transactions=("Flag for Review", "sum"),
+        ).reset_index()
+
+        summary = summary.merge(
+            risk_summary,
+            on="Account",
+            how="left"
+        )
+
+    return summary.sort_values(
+        "Total_Amount",
+        ascending=False
+    )
+
+
+def create_network_summary(df):
+    """Summarize the transfer relationships between account pairs."""
+
+    network = df.groupby(
+        ["From Bank", "Account", "To Bank", "Account.1"],
+        dropna=False
+    ).agg(
+        Transaction_Count=("Amount Paid", "size"),
+        Total_Amount=("Amount Paid", "sum"),
+        Average_Amount=("Amount Paid", "mean"),
+    ).reset_index()
+
+    # Add risk information when model predictions are available.
+    if "Risk Score" in df.columns and df["Risk Score"].notna().any():
+
+        risk_summary = df.groupby(
+            ["From Bank", "Account", "To Bank", "Account.1"],
+            dropna=False
+        ).agg(
+            Maximum_Risk_Score=("Risk Score", "max"),
+            Average_Risk_Score=("Risk Score", "mean"),
+            Flagged_Transactions=("Flag for Review", "sum"),
+        ).reset_index()
+
+        network = network.merge(
+            risk_summary,
+            on=["From Bank", "Account", "To Bank", "Account.1"],
+            how="left"
+        )
+
+    return network.sort_values(
+        "Total_Amount",
+        ascending=False
+    )
+
+
+def download_csv(df, filename, label):
+    """Create a CSV download for an analysis result."""
+
+    csv = df.to_csv(index=False).encode("utf-8")
+
+    st.download_button(
+        label=label,
+        data=csv,
+        file_name=filename,
+        mime="text/csv",
+        use_container_width=True,
+    )
+
+
+# ============================================================
+# APPLICATION HEADER
+# ============================================================
+
+st.title("AML Statement Analyzer")
+
+st.markdown(
+    """
+    Analyze banking transaction histories, identify potentially
+    suspicious transactions, and examine account activity and
+    transaction relationships.
+    """
+)
+
+st.caption(
+    "Academic prototype • Transaction-level machine learning "
+    "• Flags require human review"
+)
+
+st.divider()
+
+
+# ============================================================
+# SIDEBAR
+# ============================================================
+
+st.sidebar.title("AML Analysis")
+
+st.sidebar.markdown("### Upload Dataset")
+
+uploaded_file = st.sidebar.file_uploader(
+    "Upload transaction history CSV",
+    type=["csv"],
+)
+
+st.sidebar.divider()
+
+# The model threshold determines which transactions are flagged.
+if artifact is not None:
+    default_threshold = float(
+        artifact.get("threshold", 0.5)
+    )
+else:
+    default_threshold = 0.5
+
+threshold = st.sidebar.slider(
+    "Risk Review Threshold",
+    min_value=0.0,
+    max_value=1.0,
+    value=default_threshold,
+    step=0.05,
+)
+
+st.sidebar.divider()
+
+# Give the user a clear indication of model availability.
+if artifact is not None:
+    st.sidebar.success("Trained model loaded")
+else:
+    st.sidebar.warning("Model not available")
+
+st.sidebar.caption(
+    "Only structured CSV transaction histories are supported."
+)
+
+
+# ============================================================
+# INITIAL PAGE STATE
+# ============================================================
+
+if uploaded_file is None:
+
+    st.info(
+        "Upload a transaction-history CSV using the sidebar "
+        "to begin your AML analysis."
+    )
+
+    # Explain what the application can analyze.
+    col1, col2, col3 = st.columns(3)
+
+    with col1:
+        st.subheader("Transaction Analysis")
+        st.write(
+            "Review individual transfers and identify transactions "
+            "that may require further investigation."
+        )
+
+    with col2:
+        st.subheader("Account Analysis")
+        st.write(
+            "Examine transaction counts, amounts, and activity "
+            "associated with individual accounts."
+        )
+
+    with col3:
+        st.subheader("Network Analysis")
+        st.write(
+            "Explore relationships between sending and receiving "
+            "accounts."
+        )
+
+    st.divider()
+
+    st.subheader("Supported Dataset")
+
+    st.write(
+        "The application expects an IBM AML-style transaction CSV "
+        "containing the following fields:"
+    )
+
+    st.code(
+        "Timestamp, From Bank, Account, To Bank, Account.1, "
+        "Amount Received, Receiving Currency, Amount Paid, "
+        "Payment Currency, Payment Format",
+        language="text",
+    )
+
+    st.caption(
+        "The application does not currently accept PDF bank statements."
+    )
+
+    st.stop()
+
+
+# ============================================================
+# LOAD AND ANALYZE UPLOADED DATA
+# ============================================================
+
+try:
+
+    with st.spinner("Processing transaction history..."):
+
+        raw_df = read_uploaded_csv(uploaded_file)
+
+        if raw_df.empty:
+            raise ValueError("The uploaded CSV file is empty.")
+
+        results = analyze_transactions(
+            raw_df,
+            artifact,
+            threshold
+        )
+
+except Exception as error:
+
+    st.error(f"Unable to analyze the uploaded dataset: {error}")
+
+    st.info(
+        "Check that your CSV contains the required IBM AML transaction "
+        "columns and that the file is not corrupted."
+    )
+
+    st.stop()
+
+
+# ============================================================
+# CALCULATE DASHBOARD STATISTICS
+# ============================================================
+
+total_transactions = len(results)
+
+unique_senders = results["Account"].nunique()
+
+unique_receivers = results["Account.1"].nunique()
+
+total_banks = pd.concat(
+    [results["From Bank"], results["To Bank"]]
+).nunique()
+
+model_available = (
+    artifact is not None
+    and results["Risk Score"].notna().any()
+)
+
+if model_available:
+
+    flagged_transactions = int(
+        results["Flag for Review"].sum()
+    )
+
+    flagged_percentage = (
+        flagged_transactions / total_transactions
+    ) * 100
+
+else:
+
+    flagged_transactions = None
+    flagged_percentage = None
+
+
+# ============================================================
+# MAIN NAVIGATION
+# ============================================================
+
+dashboard_tab, transaction_tab, account_tab, network_tab, reports_tab, metrics_tab = st.tabs(
+    [
+        "Dashboard",
+        "Transaction Analysis",
+        "Account Analysis",
+        "Network Analysis",
+        "Reports",
+        "Model & Metrics",
+    ]
+)
+
+
+# ============================================================
+# 1. DASHBOARD
+# ============================================================
+
+with dashboard_tab:
+
+    st.header("Dashboard Overview")
+
+    # Display the key statistics for the uploaded transaction dataset.
+    col1, col2, col3, col4 = st.columns(4)
+
+    col1.metric(
+        "Total Transactions",
+        f"{total_transactions:,}"
+    )
+
+    col2.metric(
+        "Unique Senders",
+        f"{unique_senders:,}"
+    )
+
+    col3.metric(
+        "Unique Receivers",
+        f"{unique_receivers:,}"
+    )
+
+    if model_available:
+
+        col4.metric(
+            "Flagged Transactions",
+            f"{flagged_transactions:,}",
+            f"{flagged_percentage:.2f}%"
+        )
+
     else:
-        show_flagged = st.checkbox("Show flagged transactions only", value=False)
-        view = scored[scored["Flag for review"]] if show_flagged else scored
-        st.caption(f"Showing {len(view):,} of {len(scored):,} transactions")
-        st.dataframe(view.sort_values("Risk score (uncalibrated)", ascending=False), use_container_width=True, hide_index=True)
 
-with tab_accounts:
-    st.subheader("Account investigation")
-    if current is None:
-        st.info("Upload and analyze a CSV to view account activity summaries.")
+        col4.metric(
+            "Flagged Transactions",
+            "N/A"
+        )
+
+    st.divider()
+
+    # Display a warning when the application is running without a model.
+    if not model_available:
+
+        st.warning(
+            "The dataset was loaded successfully, but no trained model "
+            "is available. Descriptive analysis is still enabled."
+        )
+
+    # Show the distribution of transaction amounts.
+    st.subheader("Transaction Amount Statistics")
+
+    amount_stats = results[
+        ["Amount Paid", "Amount Received"]
+    ].describe()
+
+    st.dataframe(
+        amount_stats,
+        use_container_width=True
+    )
+
+    # Show the transaction count over time.
+    st.subheader("Transaction Activity Over Time")
+
+    daily_activity = (
+        results
+        .set_index("Timestamp")
+        .resample("D")
+        .size()
+        .rename("Transactions")
+    )
+
+    st.line_chart(daily_activity)
+
+    # Display the highest-risk transactions when a model is available.
+    if model_available:
+
+        st.subheader("Highest-Risk Transactions")
+
+        highest_risk = results.sort_values(
+            "Risk Score",
+            ascending=False
+        ).head(10)
+
+        display_columns = [
+            "Timestamp",
+            "Account",
+            "Account.1",
+            "Amount Paid",
+            "Risk Score",
+            "Risk Level",
+        ]
+
+        st.dataframe(
+            highest_risk[display_columns],
+            use_container_width=True
+        )
+
+
+# ============================================================
+# 2. TRANSACTION ANALYSIS
+# ============================================================
+
+with transaction_tab:
+
+    st.header("Transaction-Level Analysis")
+
+    if not model_available:
+
+        st.warning(
+            "Transaction-level risk classification requires a trained model."
+        )
+
+        st.dataframe(
+            results.head(100),
+            use_container_width=True
+        )
+
     else:
-        accounts = account_summary(current)
-        a1, a2 = st.columns(2)
-        a1.metric("Unique accounts", f"{len(accounts):,}")
-        a2.metric("Accounts with multiple senders", f"{int((accounts['unique_senders'] > 1).sum()):,}")
-        st.caption("These are descriptive activity indicators, not model-generated suspicion labels.")
-        st.dataframe(accounts.head(500), use_container_width=True, hide_index=True)
 
-with tab_network:
-    st.subheader("Network and transaction relationships")
-    if current is None:
-        st.info("Upload and analyze a CSV to inspect sender-recipient relationships.")
+        st.write(
+            "Review individual transactions and their model-generated "
+            "risk scores."
+        )
+
+        # Let the user focus on flagged transactions.
+        show_flagged = st.checkbox(
+            "Show flagged transactions only"
+        )
+
+        transaction_results = results.copy()
+
+        if show_flagged:
+
+            transaction_results = transaction_results[
+                transaction_results["Flag for Review"]
+            ]
+
+        st.metric(
+            "Transactions Displayed",
+            f"{len(transaction_results):,}"
+        )
+
+        transaction_columns = [
+            "Timestamp",
+            "From Bank",
+            "Account",
+            "To Bank",
+            "Account.1",
+            "Amount Paid",
+            "Payment Currency",
+            "Payment Format",
+            "Risk Score (%)",
+            "Risk Level",
+        ]
+
+        st.dataframe(
+            transaction_results[transaction_columns],
+            use_container_width=True,
+            height=500
+        )
+
+        download_csv(
+            transaction_results,
+            "aml_transaction_analysis.csv",
+            "Download Transaction Analysis"
+        )
+
+
+# ============================================================
+# 3. ACCOUNT ANALYSIS
+# ============================================================
+
+with account_tab:
+
+    st.header("Account-Level Analysis")
+
+    st.write(
+        "Examine transaction activity associated with individual accounts."
+    )
+
+    account_results = create_account_summary(results)
+
+    st.dataframe(
+        account_results,
+        use_container_width=True,
+        height=450
+    )
+
+    st.divider()
+
+    # Allow the user to inspect a specific account's transaction history.
+    st.subheader("Individual Account Investigation")
+
+    account_options = sorted(
+        set(results["Account"].astype(str))
+        | set(results["Account.1"].astype(str))
+    )
+
+    if account_options:
+
+        selected_account = st.selectbox(
+            "Select Account",
+            account_options
+        )
+
+        account_transactions = results[
+            (
+                results["Account"].astype(str) == selected_account
+            )
+            |
+            (
+                results["Account.1"].astype(str) == selected_account
+            )
+        ]
+
+        st.write(
+            f"Transactions associated with account: {selected_account}"
+        )
+
+        st.dataframe(
+            account_transactions,
+            use_container_width=True
+        )
+
+    download_csv(
+        account_results,
+        "aml_account_analysis.csv",
+        "Download Account Analysis"
+    )
+
+
+# ============================================================
+# 4. NETWORK ANALYSIS
+# ============================================================
+
+with network_tab:
+
+    st.header("Transaction Network Analysis")
+
+    st.write(
+        "Explore the relationships between sending and receiving accounts "
+        "through their transaction activity."
+    )
+
+    st.info(
+        "This is a descriptive account-relationship analysis. "
+        "It is not a separately trained graph-based AML detection model."
+    )
+
+    network_results = create_network_summary(results)
+
+    st.subheader("Account Connections")
+
+    st.dataframe(
+        network_results,
+        use_container_width=True,
+        height=500
+    )
+
+    # Highlight the most frequently used account connections.
+    st.subheader("Most Frequent Account Connections")
+
+    frequent_connections = network_results.sort_values(
+        "Transaction_Count",
+        ascending=False
+    ).head(10)
+
+    st.dataframe(
+        frequent_connections,
+        use_container_width=True
+    )
+
+    download_csv(
+        network_results,
+        "aml_network_analysis.csv",
+        "Download Network Analysis"
+    )
+
+
+# ============================================================
+# 5. REPORTS AND EXPORTS
+# ============================================================
+
+with reports_tab:
+
+    st.header("Analysis Reports")
+
+    st.write(
+        "Export the transaction, account, and network analysis results."
+    )
+
+    st.subheader("Transaction Report")
+
+    download_csv(
+        results,
+        "aml_full_transaction_report.csv",
+        "Download Full Transaction Report"
+    )
+
+    st.divider()
+
+    st.subheader("Account Report")
+
+    download_csv(
+        create_account_summary(results),
+        "aml_account_report.csv",
+        "Download Account Report"
+    )
+
+    st.divider()
+
+    st.subheader("Network Report")
+
+    download_csv(
+        create_network_summary(results),
+        "aml_network_report.csv",
+        "Download Network Report"
+    )
+
+    st.divider()
+
+    # Generate a compact summary of the current analysis.
+    st.subheader("Analysis Summary")
+
+    report_summary = {
+        "Total Transactions": total_transactions,
+        "Unique Sender Accounts": unique_senders,
+        "Unique Receiver Accounts": unique_receivers,
+        "Unique Banks": total_banks,
+        "Trained Model Available": model_available,
+        "Review Threshold": threshold,
+    }
+
+    if model_available:
+
+        report_summary["Flagged Transactions"] = (
+            flagged_transactions
+        )
+
+        report_summary["Flagged Percentage"] = round(
+            flagged_percentage,
+            2
+        )
+
+    st.json(report_summary)
+
+
+# ============================================================
+# 6. MODEL AND EVALUATION METRICS
+# ============================================================
+
+with metrics_tab:
+
+    st.header("Model Information & Evaluation")
+
+    if artifact is None:
+
+        st.warning(
+            "No trained model is currently available. "
+            "Run train.py to generate aml_model.joblib."
+        )
+
     else:
-        network = network_summary(current)
-        n1, n2, n3 = st.columns(3)
-        n1.metric("Distinct sender-recipient links", f"{len(network):,}")
-        n2.metric("Repeated links", f"{int((network['transaction_count'] > 1).sum()):,}")
-        n3.metric("Links with 5+ transfers", f"{int((network['transaction_count'] >= 5).sum()):,}")
-        st.caption("Relationship summaries help explore flow patterns. They do not establish that an account or transfer is involved in money laundering.")
-        st.dataframe(network.head(500), use_container_width=True, hide_index=True)
 
-with tab_reports:
-    st.subheader("Reports and exports")
-    if current is None:
-        st.info("Run an analysis to make downloadable reports available.")
+        st.success("Trained model successfully loaded.")
+
+        st.write(
+            "**Model type:** HistGradientBoostingClassifier"
+        )
+
+        st.write(
+            f"**Default threshold:** {artifact.get('threshold', 0.5)}"
+        )
+
+        st.subheader("Model Features")
+
+        # Show the feature inputs used by the transaction classifier.
+        st.code(
+            "\n".join(artifact["features"]),
+            language="text"
+        )
+
+    st.divider()
+
+    st.subheader("Training Evaluation Results")
+
+    if metrics is None:
+
+        st.info(
+            "No evaluation_metrics.json file was found. "
+            "Your current train.py saves the model but does not "
+            "save a separate metrics JSON file."
+        )
+
     else:
-        st.download_button("Download uploaded transaction data (CSV)", current.to_csv(index=False).encode("utf-8"), "aml_transaction_profile.csv", "text/csv", use_container_width=True)
-        if st.session_state.scored_df is not None:
-            result = st.session_state.scored_df
-            st.download_button("Download model results (CSV)", result.to_csv(index=False).encode("utf-8"), "aml_model_review_results.csv", "text/csv", use_container_width=True)
-        else:
-            st.caption("Model-results export will become available after model training and scoring.")
 
-with tab_model:
-    st.subheader("Model status and evaluation")
-    if model_ready:
-        st.success("A model artifact is available.")
-        if METRICS_PATH.exists():
-            try:
-                metrics = json.loads(METRICS_PATH.read_text(encoding="utf-8"))
-                metric_cols = st.columns(min(4, max(1, len(metrics))))
-                for col, (name, value) in zip(metric_cols, metrics.items()):
-                    if isinstance(value, (int, float)):
-                        col.metric(name.replace("_", " ").title(), f"{value:.4f}")
-                st.json(metrics)
-            except Exception as exc:
-                st.warning(f"Could not read evaluation_metrics.json: {exc}")
-        else:
-            st.info("Evaluation metrics file has not been added yet.")
-    else:
-        st.warning("No trained model is connected yet.")
-        st.write("The interface and data-profiling features are available now. Transaction risk scoring will be enabled after training produces aml_model.joblib.")
-        st.markdown("**Planned model evaluation**")
-        st.write("Precision · Recall · F1-score · ROC-AUC · Average precision · Confusion matrix")
+        # Display metrics only when they have actually been generated.
+        metric_col1, metric_col2, metric_col3 = st.columns(3)
 
-st.markdown("---")
-st.caption("AML Statement Analyzer · Academic prototype · Analytical indicators require human review and are not legal determinations.")
+        metric_col1.metric(
+            "ROC-AUC",
+            f"{metrics.get('roc_auc', 0):.4f}"
+        )
+
+        metric_col2.metric(
+            "Average Precision",
+            f"{metrics.get('average_precision', 0):.4f}"
+        )
+
+        metric_col3.metric(
+            "F1 Score",
+            f"{metrics.get('f1_score', 0):.4f}"
+        )
+
+        metric_col4, metric_col5, metric_col6 = st.columns(3)
+
+        metric_col4.metric(
+            "Precision",
+            f"{metrics.get('precision', 0):.4f}"
+        )
+
+        metric_col5.metric(
+            "Recall",
+            f"{metrics.get('recall', 0):.4f}"
+        )
+
+        metric_col6.metric(
+            "Test Transactions",
+            f"{metrics.get('test_rows', 0):,}"
+        )
+
+        # Display the classification report if it exists.
+        if "classification_report" in metrics:
+
+            st.subheader("Classification Report")
+
+            classification_df = pd.DataFrame(
+                metrics["classification_report"]
+            ).transpose()
+
+            st.dataframe(
+                classification_df,
+                use_container_width=True
+            )
+
+    st.caption(
+        "Risk scores are model-generated indicators for human review. "
+        "They are not proof of money laundering."
+    )
+
+
+# ============================================================
+# APPLICATION FOOTER
+# ============================================================
+
+st.divider()
+
+st.caption(
+    "AML Statement Analyzer | Academic Prototype | "
+    "Automated flags require human investigation."
+)
