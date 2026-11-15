@@ -10,6 +10,7 @@ fabricating risk scores or laundering flags.
 
 import gc
 import json
+from datetime import datetime
 from pathlib import Path
 
 import pandas as pd
@@ -19,6 +20,11 @@ try:
     import joblib
 except ImportError:
     joblib = None
+
+try:
+    from fpdf import FPDF
+except ImportError:
+    FPDF = None
 
 from common import FEATURES, prepare
 
@@ -36,7 +42,6 @@ st.set_page_config(
 )
 
 # ------------------------------ Custom CSS Theme ---------------------------
-# Inject clean light-mode styling for metric cards, dropzones, and status badges
 st.markdown("""
 <style>
 :root { color-scheme: light; }
@@ -60,7 +65,6 @@ hr { border-color: #e1e7f0; }
 """, unsafe_allow_html=True)
 
 # ------------------------------ Data & Model Helpers -----------------------
-# Whitelist of supported IBM AML columns to minimize memory usage on large CSVs
 ALLOWED_COLS = {
     "Timestamp", "From Bank", "Account", "To Bank", "Account.1",
     "To Account", "Amount Received", "Receiving Currency",
@@ -69,12 +73,6 @@ ALLOWED_COLS = {
 
 
 def read_csv_safely(file) -> pd.DataFrame:
-    """
-    Read an uploaded CSV stream using explicit dtypes and column filtering.
-
-    Enforcing string dtypes on bank/account identifiers prevents leading-zero loss,
-    while float32 downcasting cuts numerical RAM usage in half.
-    """
     file.seek(0)
     df = pd.read_csv(
         file,
@@ -93,7 +91,6 @@ def read_csv_safely(file) -> pd.DataFrame:
         },
         low_memory=False,
     )
-    # Normalize header whitespace and harmonize 'To Account' -> 'Account.1'
     df.columns = [c.strip() for c in df.columns]
     if "Account.1" not in df.columns and "To Account" in df.columns:
         df.rename(columns={"To Account": "Account.1"}, inplace=True)
@@ -101,7 +98,6 @@ def read_csv_safely(file) -> pd.DataFrame:
 
 
 def money_label(value) -> str:
-    """Format numeric monetary values with thousands separators and two decimals."""
     try:
         return f"{float(value):,.2f}"
     except (TypeError, ValueError):
@@ -109,12 +105,6 @@ def money_label(value) -> str:
 
 
 def account_summary(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Aggregate inbound and outbound activity per unique (Bank, Account ID) pair.
-
-    Computes sent/received counts, total flow volumes, and counterparty fan-in/fan-out
-    to highlight high-throughput or hub accounts.
-    """
     sender = df.groupby(["From Bank", "Account"], dropna=False).agg(
         transactions_sent=("Amount Paid", "size"),
         total_sent=("Amount Paid", "sum"),
@@ -135,12 +125,6 @@ def account_summary(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def network_summary(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Summarize directed sender-to-recipient transfer edges across the dataset.
-
-    Tracks transfer frequency, cumulative volume, and first/last interaction timestamps
-    to help analysts spot repeated layering or structuring corridors.
-    """
     result = df.groupby(
         ["From Bank", "Account", "To Bank", "Account.1"], dropna=False
     ).agg(
@@ -152,14 +136,128 @@ def network_summary(df: pd.DataFrame) -> pd.DataFrame:
     return result.sort_values(["transaction_count", "total_amount"], ascending=False)
 
 
-def load_model():
-    """
-    Attempt to deserialize the trained model artifact from disk.
+def build_pdf_report(df: pd.DataFrame, scored_df: pd.DataFrame, threshold: float) -> bytes:
+    """Generate an executive summary PDF with KPI boxes, narrative findings, and top flagged rows."""
+    pdf = FPDF(orientation="L", unit="mm", format="A4")
+    pdf.set_auto_page_break(auto=True, margin=14)
+    pdf.add_page()
 
-    Returns:
-        Tuple of (artifact_dict, error_message). If loading succeeds, error_message
-        is None; otherwise artifact_dict is None and error_message explains why.
-    """
+    # Title Banner
+    pdf.set_font("Helvetica", "B", 16)
+    pdf.set_text_color(23, 36, 58)
+    pdf.cell(0, 10, "AML Statement Analyzer - Executive Risk Review Report", new_x="LMARGIN", new_y="NEXT")
+
+    pdf.set_font("Helvetica", "", 9.5)
+    pdf.set_text_color(97, 113, 138)
+    generated_at = datetime.now().strftime("%Y-%m-%d %H:%M")
+    pdf.cell(
+        0, 6,
+        f"Generated: {generated_at}   |   Academic Prototype   |   Indicators require human investigation",
+        new_x="LMARGIN", new_y="NEXT",
+    )
+    pdf.ln(4)
+
+    # Calculate key statistics
+    flagged = scored_df[scored_df["Flag for review"]]
+    total_tx = len(df)
+    total_accounts = pd.concat([df["Account"], df["Account.1"]]).nunique()
+    total_vol = float(df["Amount Paid"].sum())
+    flag_rate = (len(flagged) / total_tx * 100) if total_tx > 0 else 0.0
+
+    # Summary Metrics Box
+    pdf.set_fill_color(244, 247, 251)
+    pdf.set_draw_color(225, 231, 240)
+    pdf.set_font("Helvetica", "B", 10)
+    pdf.set_text_color(23, 36, 58)
+    pdf.cell(67, 9, f"Transactions Analyzed: {total_tx:,}", border=1, fill=True)
+    pdf.cell(67, 9, f"Unique Accounts: {total_accounts:,}", border=1, fill=True)
+    pdf.cell(67, 9, f"Total Volume: {total_vol:,.2f}", border=1, fill=True)
+    pdf.cell(68, 9, f"Flagged (>={threshold:.2f}): {len(flagged):,} ({flag_rate:.2f}%)", border=1, fill=True, new_x="LMARGIN", new_y="NEXT")
+    pdf.ln(5)
+
+    # Narrative Executive Summary Paragraph
+    pdf.set_font("Helvetica", "B", 11)
+    pdf.set_text_color(23, 36, 58)
+    pdf.cell(0, 7, "Executive Overview & Key Findings", new_x="LMARGIN", new_y="NEXT")
+
+    if flagged.empty:
+        narrative = (
+            f"This screening evaluated {total_tx:,} transactions across {total_accounts:,} unique accounts "
+            f"(total volume: {total_vol:,.2f}). At the configured review threshold of {threshold:.2f}, "
+            "no transactions exceeded the suspicion cutoff. Analysts may lower the threshold in the application "
+            "to inspect borderline activity."
+        )
+    else:
+        top_currency = flagged["Payment Currency"].mode().iloc[0] if not flagged["Payment Currency"].empty else "N/A"
+        top_format = flagged["Payment Format"].mode().iloc[0] if not flagged["Payment Format"].empty else "N/A"
+        max_score = float(flagged["Risk score (uncalibrated)"].max())
+        flagged_vol = float(flagged["Amount Paid"].sum())
+        narrative = (
+            f"This automated AML screening evaluated {total_tx:,} transactions across {total_accounts:,} unique accounts "
+            f"(total volume: {total_vol:,.2f}). At a review threshold of {threshold:.2f}, the machine learning model "
+            f"prioritized {len(flagged):,} transaction(s) ({flag_rate:.2f}% of activity, totaling {flagged_vol:,.2f} in volume) "
+            f"for human compliance review. Flagged activity peaked at a risk score of {max_score:.4f}, with {top_currency} "
+            f"as the most frequent payment currency and {top_format} as the primary transfer method. These flags serve "
+            "as investigative triage indicators and do not constitute legal determinations of money laundering."
+        )
+
+    pdf.set_font("Helvetica", "", 9.5)
+    pdf.set_text_color(45, 58, 78)
+    pdf.multi_cell(0, 5.5, narrative)
+    pdf.ln(5)
+
+    # Top 25 Highest-Risk Flagged Transactions Table
+    pdf.set_font("Helvetica", "B", 11)
+    pdf.set_text_color(23, 36, 58)
+    pdf.cell(0, 7, "Top 25 Highest-Risk Flagged Transactions", new_x="LMARGIN", new_y="NEXT")
+    pdf.ln(1)
+
+    headers = ["Timestamp", "From Bank", "Sender Account", "To Bank", "Recipient Account", "Amount Paid", "Currency", "Format", "Risk Score"]
+    widths = [38, 22, 38, 22, 38, 32, 24, 31, 24]
+
+    pdf.set_font("Helvetica", "B", 8.5)
+    pdf.set_fill_color(41, 77, 124)
+    pdf.set_text_color(255, 255, 255)
+    for h, w in zip(headers, widths):
+        pdf.cell(w, 8, h, border=1, fill=True, align="C")
+    pdf.ln()
+
+    top_rows = flagged.nlargest(25, "Risk score (uncalibrated)")
+    pdf.set_font("Helvetica", "", 8)
+    pdf.set_text_color(23, 36, 58)
+
+    if top_rows.empty:
+        pdf.cell(sum(widths), 8, "No transactions exceeded the selected review threshold.", border=1, align="C")
+        pdf.ln()
+    else:
+        for idx, (_, row) in enumerate(top_rows.iterrows()):
+            fill = idx % 2 == 1
+            pdf.set_fill_color(248, 250, 253)
+            vals = [
+                str(row.get("Timestamp", ""))[:19],
+                str(row.get("From Bank", ""))[:12],
+                str(row.get("Account", ""))[:20],
+                str(row.get("To Bank", ""))[:12],
+                str(row.get("Account.1", ""))[:20],
+                f"{float(row.get('Amount Paid', 0)):,.2f}",
+                str(row.get("Payment Currency", ""))[:12],
+                str(row.get("Payment Format", ""))[:16],
+                f"{float(row.get('Risk score (uncalibrated)', 0)):.4f}",
+            ]
+            for val, w in zip(vals, widths):
+                align = "R" if w in (32, 24) and val.replace(",", "").replace(".", "").isdigit() else "L"
+                pdf.cell(w, 7, val, border=1, fill=fill, align=align)
+            pdf.ln()
+
+    pdf.ln(4)
+    pdf.set_font("Helvetica", "I", 8)
+    pdf.set_text_color(97, 113, 138)
+    pdf.cell(0, 6, "Note: Complete flagged transaction records are available via the full CSV export in the AML Statement Analyzer.")
+
+    return bytes(pdf.output())
+
+
+def load_model():
     if joblib is None:
         return None, "joblib is not installed"
     if not MODEL_PATH.exists():
@@ -207,7 +305,6 @@ with right:
     )
 
 # ------------------------------ Top KPI Summary Cards ----------------------
-# Persist uploaded and scored DataFrames across tab switches via st.session_state
 if "analysis_df" not in st.session_state:
     st.session_state.analysis_df = None
 if "scored_df" not in st.session_state:
@@ -246,7 +343,7 @@ tab_dashboard, tab_analyze, tab_transactions, tab_accounts, tab_network, tab_rep
     "⚙ Model & Metrics",
 ])
 
-# 1. Dashboard Tab: High-level volume and temporal activity charts
+# 1. Dashboard Tab
 with tab_dashboard:
     st.subheader("Dashboard overview")
     if current is None:
@@ -277,7 +374,7 @@ with tab_dashboard:
         else:
             st.success(f"The connected model flagged {flagged_count:,} transaction(s) for human review at the selected threshold.")
 
-# 2. New Analysis Tab: CSV upload, threshold selection, and ML inference execution
+# 2. New Analysis Tab
 with tab_analyze:
     st.subheader("Start a new analysis")
     st.write("Upload structured transaction history and choose the scope of analysis.")
@@ -312,14 +409,12 @@ with tab_analyze:
     if st.button("Analyze Transactions", type="primary", use_container_width=True, disabled=(uploaded is None)):
         try:
             with st.spinner("Loading and profiling transaction history..."):
-                # Release previous DataFrames before loading new data to prevent memory spikes
                 st.session_state.analysis_df = None
                 st.session_state.scored_df = None
                 gc.collect()
 
                 raw = read_csv_safely(uploaded)
 
-                # Validate presence of all mandatory IBM AML schema columns
                 required = [
                     "Timestamp", "From Bank", "Account", "To Bank", "Account.1",
                     "Amount Received", "Receiving Currency", "Amount Paid",
@@ -329,7 +424,6 @@ with tab_analyze:
                 if missing:
                     raise ValueError("Missing required CSV columns: " + ", ".join(missing))
 
-                # Parse timestamps and sanitize numeric amounts
                 raw["Timestamp"] = pd.to_datetime(raw["Timestamp"], errors="coerce")
                 raw.dropna(subset=["Timestamp"], inplace=True)
                 for col in ["Amount Paid", "Amount Received"]:
@@ -341,7 +435,6 @@ with tab_analyze:
                 st.session_state.analysis_type = analysis_type
                 st.session_state.threshold = threshold
 
-                # Run feature engineering (common.prepare) and generate risk probabilities
                 if model_ready:
                     prepared = prepare(raw, inplace=True)
                     if list(artifact.get("features", FEATURES)) != list(FEATURES):
@@ -355,12 +448,10 @@ with tab_analyze:
                     st.session_state.analysis_df = raw
 
                 gc.collect()
-                # Trigger an immediate rerun so top KPI cards and all tabs refresh right away
                 st.rerun()
         except Exception as exc:
             st.error(f"Analysis could not be completed: {exc}")
 
-    # Display persistent confirmation banner once analysis data is stored in session state
     if current is not None:
         if st.session_state.scored_df is not None:
             st.success(
@@ -373,7 +464,7 @@ with tab_analyze:
                 "No risk scores or suspicious-transaction labels were generated because the model has not been trained."
             )
 
-# 3. Transactions Tab: Ranked table of highest-risk flagged transactions
+# 3. Transactions Tab
 with tab_transactions:
     st.subheader("Transaction investigation")
     scored = st.session_state.scored_df
@@ -385,11 +476,14 @@ with tab_transactions:
     else:
         show_flagged = st.checkbox("Show flagged transactions only", value=True)
         view = scored[scored["Flag for review"]] if show_flagged else scored
-        top_view = view.nlargest(1000, "Risk score (uncalibrated)")
+        top_view = view.nlargest(1000, "Risk score (uncalibrated)").copy()
+        top_view["Flag for review"] = top_view["Flag for review"].map(
+            {True: "🟢 YES (Flagged)", False: "⚪ No"}
+        )
         st.caption(f"Showing top {len(top_view):,} of {len(view):,} matching transactions (download full results in Reports).")
         st.dataframe(top_view, use_container_width=True, hide_index=True)
 
-# 4. Accounts Tab: Entity-level inbound/outbound volume aggregation
+# 4. Accounts Tab
 with tab_accounts:
     st.subheader("Account investigation")
     if current is None:
@@ -402,7 +496,7 @@ with tab_accounts:
         st.caption("These are descriptive activity indicators, not model-generated suspicion labels (showing top 500 by volume).")
         st.dataframe(accounts.head(500), use_container_width=True, hide_index=True)
 
-# 5. Network Tab: Sender-recipient corridor frequency and volume
+# 5. Network Tab
 with tab_network:
     st.subheader("Network and transaction relationships")
     if current is None:
@@ -416,7 +510,7 @@ with tab_network:
         st.caption("Relationship summaries help explore flow patterns (showing top 500 links).")
         st.dataframe(network.head(500), use_container_width=True, hide_index=True)
 
-# 6. Reports Tab: CSV download of flagged transactions for compliance review
+# 6. Reports Tab
 with tab_reports:
     st.subheader("Reports and exports")
     if current is None:
@@ -424,17 +518,33 @@ with tab_reports:
     elif st.session_state.scored_df is not None:
         flagged_only = st.session_state.scored_df[st.session_state.scored_df["Flag for review"]]
         st.write(f"Export the **{len(flagged_only):,} flagged transactions** for human investigation:")
-        st.download_button(
-            "Download flagged transactions (CSV)",
-            flagged_only.to_csv(index=False).encode("utf-8"),
-            "aml_flagged_review_results.csv",
-            "text/csv",
-            use_container_width=True,
-        )
+
+        r1, r2 = st.columns(2)
+        with r1:
+            st.download_button(
+                "Download Full Flagged Dataset (CSV)",
+                flagged_only.to_csv(index=False).encode("utf-8"),
+                "aml_flagged_review_results.csv",
+                "text/csv",
+                use_container_width=True,
+            )
+        with r2:
+            if FPDF is not None:
+                active_thresh = st.session_state.get("threshold", 0.50)
+                pdf_bytes = build_pdf_report(current, st.session_state.scored_df, active_thresh)
+                st.download_button(
+                    "Download Executive Summary (PDF)",
+                    pdf_bytes,
+                    "aml_executive_summary_report.pdf",
+                    "application/pdf",
+                    use_container_width=True,
+                )
+            else:
+                st.info("Add `fpdf2>=2.7,<3` to requirements.txt to enable PDF report downloads.")
     else:
         st.write("Model-results export will become available after model training and scoring.")
 
-# 7. Model & Metrics Tab: Offline test-set evaluation metrics (PR-AUC, ROC-AUC, F1)
+# 7. Model & Metrics Tab
 with tab_model:
     st.subheader("Model status and evaluation")
     if model_ready:
@@ -442,11 +552,38 @@ with tab_model:
         if METRICS_PATH.exists():
             try:
                 metrics = json.loads(METRICS_PATH.read_text(encoding="utf-8"))
-                metric_cols = st.columns(min(4, max(1, len(metrics))))
-                for col, (name, value) in zip(metric_cols, metrics.items()):
-                    if isinstance(value, (int, float)):
-                        col.metric(name.replace("_", " ").title(), f"{value:.4f}")
-                st.json(metrics)
+
+                # Row 1: Core classification metrics
+                r1_c1, r1_c2, r1_c3, r1_c4 = st.columns(4)
+                r1_c1.metric("Average Precision", f"{metrics.get('average_precision', 0):.4f}")
+                r1_c2.metric("ROC-AUC", f"{metrics.get('roc_auc', 0):.4f}")
+                r1_c3.metric("Precision", f"{metrics.get('precision', 0):.4f}")
+                r1_c4.metric("Recall", f"{metrics.get('recall', 0):.4f}")
+
+                # Row 2: F1 and evaluation dataset breakdown
+                r2_c1, r2_c2, r2_c3 = st.columns(3)
+                r2_c1.metric("F1-Score", f"{metrics.get('f1_score', 0):.4f}")
+                r2_c2.metric("Evaluation Test Rows", f"{metrics.get('test_rows', 0):,}")
+                r2_c3.metric("Confirmed Laundering Cases in Test", f"{metrics.get('positive_test_rows', 0):,}")
+
+                # Clean classification report table instead of raw JSON
+                if "classification_report" in metrics:
+                    st.markdown("**Class-level evaluation breakdown**")
+                    report_rows = []
+                    label_map = {"0": "Normal (Class 0)", "1": "Suspicious / Laundering (Class 1)"}
+                    for cls_key in ["0", "1"]:
+                        if cls_key in metrics["classification_report"]:
+                            entry = metrics["classification_report"][cls_key]
+                            report_rows.append({
+                                "Class": label_map[cls_key],
+                                "Precision": round(entry["precision"], 4),
+                                "Recall": round(entry["recall"], 4),
+                                "F1-Score": round(entry["f1-score"], 4),
+                                "Support (Rows)": int(entry["support"]),
+                            })
+                    if report_rows:
+                        st.dataframe(pd.DataFrame(report_rows), use_container_width=True, hide_index=True)
+
             except Exception as exc:
                 st.warning(f"Could not read evaluation_metrics.json: {exc}")
         else:
