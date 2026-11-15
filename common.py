@@ -1,121 +1,229 @@
-"""
-common.py — shared input validation and feature engineering.
 
-Training and Streamlit prediction both call prepare(), so they use the
-same feature definitions and transformations.
-"""
 import numpy as np
 import pandas as pd
 
-# IBM HI-Small transaction columns expected by this prototype.
-REQUIRED_COLUMNS = [
-    "Timestamp", "From Bank", "Account", "To Bank", "Account.1",
-    "Amount Received", "Receiving Currency", "Amount Paid",
-    "Payment Currency", "Payment Format",
-]
 
-# Keep this order identical during training and prediction.
-FEATURES = [
-    "amount_paid", "amount_received", "hour", "day_of_week",
-    "same_account", "same_bank", "currency_mismatch", "amount_difference",
-    "sender_prior_count", "receiver_prior_count",
-    "sender_prior_total", "receiver_prior_total", "payment_format_code",
-]
-
-PAYMENT_FORMAT_CODES = {
-    "ACH": 1, "Cheque": 2, "Credit Card": 3, "Reinvestment": 4,
-    "Wire": 5, "Cash": 6, "Bitcoin": 7,
+# Standardize column names so the application can handle common IBM AML
+# dataset variations without requiring manual changes to the CSV file.
+COLUMN_ALIASES = {
+    "To Account": "Account.1",
+    "From Account": "Account",
+    "Is_Laundering": "Is Laundering",
 }
 
 
-def prepare(data: pd.DataFrame) -> pd.DataFrame:
-    """
-    Validate and transform transaction rows into model-ready features.
+# These are the numerical features used by the transaction-level classifier.
+FEATURES = [
+    "amount_paid",
+    "amount_received",
+    "hour",
+    "day_of_week",
+    "same_account",
+    "same_bank",
+    "currency_mismatch",
+    "amount_difference",
+    "sender_prior_count",
+    "receiver_prior_count",
+    "sender_prior_total",
+    "receiver_prior_total",
+    "payment_format_code",
+]
 
-    Prior-activity fields are calculated after chronological sorting and
-    exclude the current transaction. The target label is never a feature.
-    """
-    if not isinstance(data, pd.DataFrame) or data.empty:
-        raise ValueError("Input must be a non-empty pandas DataFrame.")
 
-    df = data.copy()
+def normalize_columns(df):
+    """Rename supported dataset columns to the application's standard names."""
 
-    # Support an alternate receiving-account column name.
-    if "Account.1" not in df.columns and "To Account" in df.columns:
-        df = df.rename(columns={"To Account": "Account.1"})
+    df = df.copy()
 
-    missing = [c for c in REQUIRED_COLUMNS if c not in df.columns]
+    # Remove accidental spaces around column names before applying aliases.
+    df.columns = [str(column).strip() for column in df.columns]
+
+    # Rename alternative column names only when the standard name is absent.
+    rename_map = {
+        old: new
+        for old, new in COLUMN_ALIASES.items()
+        if old in df.columns and new not in df.columns
+    }
+
+    return df.rename(columns=rename_map)
+
+
+def validate_columns(df, require_target=False):
+    """Check that the dataset contains the columns required for analysis."""
+
+    required = [
+        "Timestamp",
+        "From Bank",
+        "Account",
+        "To Bank",
+        "Account.1",
+        "Amount Received",
+        "Receiving Currency",
+        "Amount Paid",
+        "Payment Currency",
+        "Payment Format",
+    ]
+
+    # Training requires the target label; uploaded analysis files do not.
+    if require_target:
+        required.append("Is Laundering")
+
+    missing = [column for column in required if column not in df.columns]
+
     if missing:
-        raise ValueError("Missing required columns: " + ", ".join(missing))
+        raise ValueError(
+            "The dataset is missing required columns: "
+            + ", ".join(missing)
+        )
 
-    # Parse timestamps, discard invalid dates, then preserve chronological order.
-    df["Timestamp"] = pd.to_datetime(df["Timestamp"], errors="coerce")
-    df = df.dropna(subset=["Timestamp"]).sort_values(
-        "Timestamp", kind="stable"
+
+def prepare(df, require_target=False):
+    """Clean transactions and calculate features for the AML classifier."""
+
+    df = normalize_columns(df)
+    validate_columns(df, require_target=require_target)
+
+    # Work on a separate copy to avoid modifying the original dataframe.
+    df = df.copy()
+
+    # Preserve the original row order so results can be traced back to the CSV.
+    df["_original_order"] = np.arange(len(df))
+
+    # Convert timestamps and transaction amounts into usable data types.
+    df["Timestamp"] = pd.to_datetime(
+        df["Timestamp"],
+        errors="coerce"
+    )
+
+    df["Amount Paid"] = pd.to_numeric(
+        df["Amount Paid"],
+        errors="coerce"
+    )
+
+    df["Amount Received"] = pd.to_numeric(
+        df["Amount Received"],
+        errors="coerce"
+    )
+
+    # Remove records that cannot be used for chronological feature calculation.
+    df = df.dropna(
+        subset=[
+            "Timestamp",
+            "Account",
+            "Account.1",
+            "Amount Paid",
+            "Amount Received",
+        ]
+    ).copy()
+
+    # Account identifiers are treated as strings to preserve their values.
+    for column in ["Account", "Account.1", "From Bank", "To Bank"]:
+        df[column] = df[column].astype(str)
+
+    # Sort transactions chronologically before calculating historical activity.
+    df = df.sort_values(
+        ["Timestamp", "_original_order"],
+        kind="stable"
     ).reset_index(drop=True)
-    if df.empty:
-        raise ValueError("No rows contain a valid timestamp.")
 
-    # Identifiers are categorical strings, not numeric quantities.
-    for col in ["From Bank", "Account", "To Bank", "Account.1"]:
-        df[col] = df[col].fillna("UNKNOWN").astype(str)
-
-    # Normalize descriptive fields.
-    for col in ["Receiving Currency", "Payment Currency", "Payment Format"]:
-        df[col] = df[col].fillna("UNKNOWN").astype(str).str.strip()
-
-    # Convert malformed or missing amounts to zero and prevent negatives.
-    for col in ["Amount Paid", "Amount Received"]:
-        df[col] = pd.to_numeric(df[col], errors="coerce")
-        df[col] = df[col].replace([np.inf, -np.inf], np.nan)
-        df[col] = df[col].fillna(0).clip(lower=0)
-
-    # Log scaling reduces the influence of extremely large transaction values.
-    df["amount_paid"] = np.log1p(df["Amount Paid"])
-    df["amount_received"] = np.log1p(df["Amount Received"])
-
-    # Extract time characteristics.
+    # Basic transaction amount and time features.
+    df["amount_paid"] = df["Amount Paid"].astype(float)
+    df["amount_received"] = df["Amount Received"].astype(float)
     df["hour"] = df["Timestamp"].dt.hour
     df["day_of_week"] = df["Timestamp"].dt.dayofweek
 
-    # Create bank-account identifiers to analyze sender/receiver histories.
-    sender = df["From Bank"] + ":" + df["Account"]
-    receiver = df["To Bank"] + ":" + df["Account.1"]
-
-    # Transaction relationship and currency indicators.
-    df["same_account"] = (sender == receiver).astype(int)
-    df["same_bank"] = (df["From Bank"] == df["To Bank"]).astype(int)
-    df["currency_mismatch"] = (
-        df["Receiving Currency"] != df["Payment Currency"]
+    # Identify transactions where the sender and receiver are the same account.
+    df["same_account"] = (
+        df["Account"] == df["Account.1"]
     ).astype(int)
 
-    # Amounts in different currencies are not directly comparable.
+    # Compare the sending and receiving banks.
+    df["same_bank"] = (
+        df["From Bank"] == df["To Bank"]
+    ).astype(int)
+
+    # Different currencies can explain differences between paid and received amounts.
+    df["currency_mismatch"] = (
+        df["Payment Currency"] != df["Receiving Currency"]
+    ).astype(int)
+
+    # Calculate the amount difference only when both currencies match.
     df["amount_difference"] = np.where(
         df["currency_mismatch"] == 0,
-        np.log1p((df["Amount Paid"] - df["Amount Received"]).abs()),
-        0.0,
+        np.abs(df["Amount Paid"] - df["Amount Received"]),
+        0.0
     )
 
-    # Cumulative counts/totals represent activity before the current row.
-    df["sender_prior_count"] = df.groupby(sender, sort=False).cumcount()
-    df["receiver_prior_count"] = df.groupby(receiver, sort=False).cumcount()
+    # Create a combined sender and receiver account key for historical calculations.
+    sender = df["Account"]
+    receiver = df["Account.1"]
 
-    sender_total = df.groupby(sender, sort=False)["Amount Paid"].cumsum()
-    receiver_total = df.groupby(receiver, sort=False)["Amount Received"].cumsum()
-    df["sender_prior_total"] = np.log1p(
-        (sender_total - df["Amount Paid"]).clip(lower=0)
-    )
-    df["receiver_prior_total"] = np.log1p(
-        (receiver_total - df["Amount Received"]).clip(lower=0)
+    # Calculate the number of previous transactions made by each sender.
+    # Subtracting one excludes the current transaction from its own history.
+    df["sender_prior_count"] = (
+        df.groupby(sender, sort=False)["Amount Paid"]
+        .cumcount()
     )
 
-    # Convert payment format labels into numeric categories.
+    # Calculate the number of previous transactions received by each account.
+    df["receiver_prior_count"] = (
+        df.groupby(receiver, sort=False)["Amount Received"]
+        .cumcount()
+    )
+
+    # Calculate cumulative sender amounts and subtract the current transaction.
+    sender_cumulative = (
+        df.groupby(sender, sort=False)["Amount Paid"]
+        .cumsum()
+    )
+
+    df["sender_prior_total"] = (
+        sender_cumulative - df["Amount Paid"]
+    )
+
+    # Calculate cumulative receiver amounts and subtract the current transaction.
+    receiver_cumulative = (
+        df.groupby(receiver, sort=False)["Amount Received"]
+        .cumsum()
+    )
+
+    df["receiver_prior_total"] = (
+        receiver_cumulative - df["Amount Received"]
+    )
+
+    # Convert payment formats into consistent numerical category codes.
+    payment_format = (
+        df["Payment Format"]
+        .fillna("Unknown")
+        .astype(str)
+    )
+
     df["payment_format_code"] = (
-        df["Payment Format"].map(PAYMENT_FORMAT_CODES).fillna(0).astype(int)
+        pd.Categorical(
+            payment_format,
+            categories=sorted(payment_format.unique())
+        ).codes
     )
 
-    # Guarantee finite numeric inputs for scikit-learn.
+    # Replace invalid numerical values to prevent model prediction errors.
     df[FEATURES] = (
-        df[FEATURES].replace([np.inf, -np.inf], np.nan).fillna(0)
+        df[FEATURES]
+        .replace([np.inf, -np.inf], np.nan)
+        .fillna(0)
     )
+
+    # Restore the original CSV order after chronological calculations.
+    df = (
+        df.sort_values("_original_order", kind="stable")
+        .drop(columns=["_original_order"])
+        .reset_index(drop=True)
+    )
+
+    # Convert the target label to numeric values when it is available.
+    if "Is Laundering" in df.columns:
+        df["Is Laundering"] = pd.to_numeric(
+            df["Is Laundering"],
+            errors="coerce"
+        )
+
     return df
