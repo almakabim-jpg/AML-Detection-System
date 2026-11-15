@@ -1,17 +1,16 @@
-%%writefile common.py
 """
 common.py — Shared Input Validation, Normalization, and Feature Engineering.
 
 This module serves as the single source of truth for data preprocessing across both
 the offline training pipeline (train.py) and the live Streamlit inference interface
 (app.py). By sharing this exact transformation pipeline, we prevent training-serving
-skew and guarantee that model features remain identical during training and scoring[cite: 1].
+skew and guarantee that model features remain identical during training and scoring.
 """
 
 import numpy as np
 import pandas as pd
 
-# Core transaction columns expected from the IBM Transactions for AML dataset[cite: 1].
+# Core transaction columns expected from the IBM Transactions for AML dataset.
 REQUIRED_COLUMNS = [
     "Timestamp",           # Date and time the transaction occurred
     "From Bank",           # Originating bank identifier
@@ -26,7 +25,7 @@ REQUIRED_COLUMNS = [
 ]
 
 # Ordered list of engineered numerical features passed into the ML classifier.
-# CRITICAL: Do not alter this order without retraining the model artifact[cite: 1].
+# CRITICAL: Do not alter this order without retraining the model artifact.
 FEATURES = [
     "amount_paid",           # Log-transformed payment amount
     "amount_received",       # Log-transformed received amount
@@ -73,7 +72,7 @@ def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
     # Strip accidental leading/trailing whitespace from all column headers
     df.columns = [str(col).strip() for col in df.columns]
 
-    # Harmonize alternative column naming conventions[cite: 1]
+    # Harmonize alternative column naming conventions
     if "Account.1" not in df.columns and "To Account" in df.columns:
         df.rename(columns={"To Account": "Account.1"}, inplace=True)
     if "Account" not in df.columns and "From Account" in df.columns:
@@ -90,12 +89,12 @@ def prepare(
     require_target: bool = False,
 ) -> pd.DataFrame:
     """
-    Validate raw transaction records and engineer behavioral/transactional features[cite: 1].
+    Validate raw transaction records and engineer behavioral/transactional features.
 
     To prevent data leakage, all historical account aggregations (prior counts and
     prior totals) are computed strictly AFTER sorting chronologically and exclude
-    the current transaction itself[cite: 1]. The target label ('Is Laundering') is never
-    included in the feature matrix[cite: 1].
+    the current transaction itself. The target label ('Is Laundering') is never
+    included in the feature matrix.
 
     Args:
         data: Raw transaction DataFrame.
@@ -122,7 +121,7 @@ def prepare(
 
     # 2. Temporal Parsing & Chronological Ordering
     # Strict chronological sorting is essential so cumulative historical features
-    # only reflect past activity[cite: 1].
+    # only reflect past activity.
     if not pd.api.types.is_datetime64_any_dtype(df["Timestamp"]):
         df["Timestamp"] = pd.to_datetime(df["Timestamp"], errors="coerce")
 
@@ -134,7 +133,7 @@ def prepare(
         raise ValueError("No rows contain a valid timestamp.")
 
     # 3. Categorical & Identifier Sanitization
-    # Treat bank and account IDs as opaque strings to preserve leading zeros[cite: 1, 2].
+    # Treat bank and account IDs as opaque strings to preserve leading zeros.
     for col in ["From Bank", "Account", "To Bank", "Account.1"]:
         df[col] = (
             df[col]
@@ -162,7 +161,7 @@ def prepare(
             .astype("float32")
         )
 
-    # Apply log1p (log(1 + x)) to compress extreme outliers while safely handling 0.0 values[cite: 1]
+    # Apply log1p (log(1 + x)) to compress extreme outliers while safely handling 0.0 values
     df["amount_paid"] = np.log1p(df["Amount Paid"]).astype("float32")
     df["amount_received"] = np.log1p(df["Amount Received"]).astype("float32")
 
@@ -181,7 +180,7 @@ def prepare(
         df["Receiving Currency"] != df["Payment Currency"]
     ).astype("int8")
 
-    # Measure fee/spread discrepancies only when both sides use the same currency[cite: 1]
+    # Measure fee/spread discrepancies only when both sides use the same currency
     df["amount_difference"] = np.where(
         df["currency_mismatch"] == 0,
         np.log1p((df["Amount Paid"] - df["Amount Received"]).abs()),
@@ -189,11 +188,11 @@ def prepare(
     ).astype("float32")
 
     # 7. Historical Velocity & Cumulative Volume Features (Leakage-Free)
-    # cumcount() yields 0 for an account's first transaction, 1 for its second, etc.[cite: 1]
+    # cumcount() yields 0 for an account's first transaction, 1 for its second, etc.
     df["sender_prior_count"] = df.groupby(sender, sort=False).cumcount().astype("int32")
     df["receiver_prior_count"] = df.groupby(receiver, sort=False).cumcount().astype("int32")
 
-    # Subtract the current transaction's amount from cumsum() so only PRIOR volume is visible[cite: 1]
+    # Subtract the current transaction's amount from cumsum() so only PRIOR volume is visible
     sender_total = df.groupby(sender, sort=False)["Amount Paid"].cumsum()
     receiver_total = df.groupby(receiver, sort=False)["Amount Received"].cumsum()
 
