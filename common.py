@@ -28,7 +28,20 @@ PAYMENT_FORMAT_CODES = {
 }
 
 
-def prepare(data: pd.DataFrame, inplace: bool = False) -> pd.DataFrame:
+def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Clean column whitespace and standardize alternate receiving-account names."""
+    df = df.copy()
+    df.columns = [str(c).strip() for c in df.columns]
+    if "Account.1" not in df.columns and "To Account" in df.columns:
+        df.rename(columns={"To Account": "Account.1"}, inplace=True)
+    if "Account" not in df.columns and "From Account" in df.columns:
+        df.rename(columns={"From Account": "Account"}, inplace=True)
+    if "Is Laundering" not in df.columns and "Is_Laundering" in df.columns:
+        df.rename(columns={"Is_Laundering": "Is Laundering"}, inplace=True)
+    return df
+
+
+def prepare(data: pd.DataFrame, inplace: bool = False, require_target: bool = False) -> pd.DataFrame:
     """
     Validate and transform transaction rows into model-ready features.
 
@@ -39,12 +52,13 @@ def prepare(data: pd.DataFrame, inplace: bool = False) -> pd.DataFrame:
         raise ValueError("Input must be a non-empty pandas DataFrame.")
 
     df = data if inplace else data.copy()
+    df = normalize_columns(df)
 
-    # Support an alternate receiving-account column name safely.
-    if "Account.1" not in df.columns and "To Account" in df.columns:
-        df.rename(columns={"To Account": "Account.1"}, inplace=True)
+    required = list(REQUIRED_COLUMNS)
+    if require_target:
+        required.append("Is Laundering")
 
-    missing = [c for c in REQUIRED_COLUMNS if c not in df.columns]
+    missing = [c for c in required if c not in df.columns]
     if missing:
         raise ValueError("Missing required columns: " + ", ".join(missing))
 
@@ -59,11 +73,11 @@ def prepare(data: pd.DataFrame, inplace: bool = False) -> pd.DataFrame:
 
     # Identifiers are categorical strings, not numeric quantities.
     for col in ["From Bank", "Account", "To Bank", "Account.1"]:
-        df[col] = df[col].astype(str).replace({"nan": "UNKNOWN", "None": "UNKNOWN"})
+        df[col] = df[col].astype(str).replace({"nan": "UNKNOWN", "None": "UNKNOWN", "<NA>": "UNKNOWN"})
 
     # Normalize descriptive fields.
     for col in ["Receiving Currency", "Payment Currency", "Payment Format"]:
-        df[col] = df[col].astype(str).replace({"nan": "UNKNOWN", "None": "UNKNOWN"}).str.strip()
+        df[col] = df[col].astype(str).replace({"nan": "UNKNOWN", "None": "UNKNOWN", "<NA>": "UNKNOWN"}).str.strip()
 
     # Convert malformed or missing amounts to zero and prevent negatives.
     for col in ["Amount Paid", "Amount Received"]:
