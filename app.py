@@ -355,17 +355,23 @@ with tab_analyze:
                     st.session_state.analysis_df = raw
 
                 gc.collect()
-
-            st.success(f"Successfully loaded and profiled {len(st.session_state.analysis_df):,} transaction(s).")
-            if not model_ready:
-                st.info("Data profiling is complete. No risk scores or suspicious-transaction labels were generated because the model has not been trained.")
-            else:
-                st.success("Model scoring is complete. Review flagged records in the Transactions tab.")
+                # Trigger an immediate rerun so top KPI cards and all tabs refresh right away
+                st.rerun()
         except Exception as exc:
             st.error(f"Analysis could not be completed: {exc}")
 
+    # Display persistent confirmation banner once analysis data is stored in session state
     if current is not None:
-        st.caption(f"Last loaded analysis: {len(current):,} transaction rows. Open the other tabs to explore the uploaded data.")
+        if st.session_state.scored_df is not None:
+            st.success(
+                f"Successfully loaded, profiled, and scored {len(current):,} transaction(s). "
+                "Open **Dashboard**, **Transactions**, **Accounts**, **Network**, or **Reports** above to explore the results."
+            )
+        else:
+            st.info(
+                f"Successfully loaded and profiled {len(current):,} transaction(s). "
+                "No risk scores or suspicious-transaction labels were generated because the model has not been trained."
+            )
 
 # 3. Transactions Tab: Ranked table of highest-risk flagged transactions
 with tab_transactions:
